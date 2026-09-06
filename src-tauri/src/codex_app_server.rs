@@ -335,6 +335,7 @@ fn parse_result<T: for<'de> Deserialize<'de>>(value: Option<Value>) -> Result<T,
 }
 
 fn spawn_app_server(codex_home: &Path) -> Result<Child, AppServerError> {
+    let proxy_settings = proxy::get().map_err(|_| AppServerError::QueryFailed)?;
     for executable in codex_executables() {
         let mut command = Command::new(executable);
         command
@@ -344,7 +345,7 @@ fn spawn_app_server(codex_home: &Path) -> Result<Child, AppServerError> {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        apply_proxy_env(&mut command);
+        apply_proxy_env(&mut command, &proxy_settings);
         match command.spawn() {
             Ok(child) => return Ok(child),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -355,10 +356,18 @@ fn spawn_app_server(codex_home: &Path) -> Result<Child, AppServerError> {
 }
 
 // codex app-server 通过网络访问官方接口，代理模式需同步到其环境。
-// 跟随系统模式保留父进程原有代理变量；无代理与手动模式分别显式移除/注入。
-fn apply_proxy_env(command: &mut Command) {
+// 使用配置覆盖兼容旧版 Codex：未知 feature 键会被忽略，--enable 则可能报错。
+fn apply_proxy_env(command: &mut Command, settings: &proxy::ProxySettings) {
     use proxy::{ChildProxyEnv, PROXY_VARS_FOR_REMOVE};
-    match proxy::child_proxy_env() {
+    command.args([
+        "-c",
+        if settings.mode == proxy::ProxyMode::System {
+            "features.respect_system_proxy=true"
+        } else {
+            "features.respect_system_proxy=false"
+        },
+    ]);
+    match proxy::child_proxy_env(settings) {
         ChildProxyEnv::Inherit => {}
         ChildProxyEnv::Remove => {
             for name in PROXY_VARS_FOR_REMOVE {

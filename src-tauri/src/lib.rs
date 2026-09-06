@@ -81,7 +81,7 @@ fn get_local_diagnostics(app: AppHandle) -> Result<LocalDiagnostics, String> {
 
 #[tauri::command]
 fn get_network_proxy() -> Result<proxy::ProxySettings, String> {
-    Ok(proxy::get())
+    proxy::get()
 }
 
 #[tauri::command]
@@ -400,7 +400,9 @@ pub fn run() {
         })
         .manage(app_update::AppUpdateState::default())
         .setup(|app| {
-            proxy::init(app.path().app_data_dir()?).map_err(std::io::Error::other)?;
+            if let Ok(app_data_dir) = app.path().app_data_dir() {
+                proxy::init(app_data_dir);
+            }
             if let Ok(manager) = account_manager(app.handle()) {
                 let path = manager.usage_cache_path();
                 tauri::async_runtime::spawn_blocking(move || {

@@ -11,14 +11,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{OnceLock, RwLock},
     time::Duration,
 };
 
 const PROXY_FILE_NAME: &str = "network-proxy.json";
 
-// 跟随系统模式会让 codex 子进程保留进程原本的代理环境变量，因此无需改动。
+// 跟随系统模式保留代理环境变量，并由调用方启用 Codex 系统代理策略。
 // 手动模式下需要显式注入；无代理模式则要移除可能继承到的代理变量。
 const PROXY_ENV_VARS: &[&str] = &[
     "HTTP_PROXY",
@@ -69,17 +69,25 @@ impl Default for ProxySettings {
     }
 }
 
-static SETTINGS: OnceLock<RwLock<Option<ProxySettings>>> = OnceLock::new();
+static SETTINGS: OnceLock<RwLock<Result<ProxySettings, String>>> = OnceLock::new();
 static FILE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-fn settings_runtime() -> &'static RwLock<Option<ProxySettings>> {
-    SETTINGS.get_or_init(|| RwLock::new(None))
+fn settings_runtime() -> &'static RwLock<Result<ProxySettings, String>> {
+    SETTINGS.get_or_init(|| RwLock::new(Err("代理设置尚未初始化".to_string())))
 }
 
-/// 初始化代理运行时：从应用数据目录读取（或创建默认）配置。
-pub fn init(app_data_dir: PathBuf) -> Result<(), String> {
+/// 保留读取错误，允许界面启动；网络调用必须先取得有效配置。
+pub fn init(app_data_dir: PathBuf) {
     let path = app_data_dir.join(PROXY_FILE_NAME);
-    let loaded = match fs::read(&path) {
+    if FILE_PATH.set(path.clone()).is_ok() {
+        if let Ok(mut guard) = settings_runtime().write() {
+            *guard = read_settings(&path);
+        }
+    }
+}
+
+fn read_settings(path: &Path) -> Result<ProxySettings, String> {
+    let loaded = match fs::read(path) {
         Ok(bytes) => serde_json::from_slice::<ProxySettings>(&bytes)
             .map_err(|_| "代理配置文件格式错误，请检查 network-proxy.json".to_string())?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProxySettings::default(),
@@ -88,14 +96,7 @@ pub fn init(app_data_dir: PathBuf) -> Result<(), String> {
         }
     };
     validate(&loaded)?;
-    if FILE_PATH.set(path).is_ok() {
-        let mut guard = match settings_runtime().write() {
-            Ok(guard) => guard,
-            Err(_) => return Err("代理设置初始化失败".to_string()),
-        };
-        *guard = Some(loaded);
-    }
-    Ok(())
+    Ok(loaded)
 }
 
 fn validate(settings: &ProxySettings) -> Result<(), String> {
@@ -110,12 +111,17 @@ fn validate(settings: &ProxySettings) -> Result<(), String> {
     Ok(())
 }
 
-pub fn get() -> ProxySettings {
-    settings_runtime()
-        .read()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .unwrap_or_default()
+pub fn get() -> Result<ProxySettings, String> {
+    let mut guard = settings_runtime()
+        .write()
+        .map_err(|_| "无法读取代理设置".to_string())?;
+    // 用户修复文件后可重新打开设置页恢复，无需重启或覆盖坏文件。
+    if guard.is_err() {
+        if let Some(path) = FILE_PATH.get() {
+            *guard = read_settings(path);
+        }
+    }
+    guard.clone()
 }
 
 /// 保存配置并即时生效；写入失败会保留内存中的旧值。
@@ -134,7 +140,7 @@ pub fn set(next: ProxySettings) -> Result<ProxySettings, String> {
         let mut guard = settings_runtime()
             .write()
             .map_err(|_| "代理设置保存失败".to_string())?;
-        *guard = Some(next.clone());
+        *guard = Ok(next.clone());
     }
     Ok(next)
 }
@@ -189,8 +195,7 @@ pub enum ChildProxyEnv {
     },
 }
 
-pub fn child_proxy_env() -> ChildProxyEnv {
-    let settings = get();
+pub fn child_proxy_env(settings: &ProxySettings) -> ChildProxyEnv {
     match settings.mode {
         ProxyMode::Off => ChildProxyEnv::Remove,
         ProxyMode::System => ChildProxyEnv::Inherit,
@@ -220,7 +225,7 @@ pub fn cached_client(
     timeout: Duration,
     build_error: impl FnOnce() -> String,
 ) -> Result<Client, String> {
-    let settings = get();
+    let settings = get()?;
     let key = (settings.clone(), timeout.as_secs());
     let cache = CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
     if let Ok(guard) = cache.read() {
@@ -239,23 +244,87 @@ pub fn cached_client(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn http_stub(body: &'static str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (address, task)
+    }
+
+    #[test]
+    fn requests_follow_off_manual_and_bypass_rules() {
+        tauri::async_runtime::block_on(async {
+            let (origin, origin_task) = http_stub("origin").await;
+            let (proxy, proxy_task) = http_stub("proxy").await;
+            for (mode, no_proxy, expected) in [
+                (ProxyMode::Off, "", "origin"),
+                (ProxyMode::Manual, "", "proxy"),
+                (ProxyMode::Manual, "127.0.0.1", "origin"),
+            ] {
+                let settings = ProxySettings {
+                    mode,
+                    proxy_url: format!("http://{proxy}"),
+                    no_proxy: no_proxy.into(),
+                };
+                let mut builder = Client::builder().timeout(Duration::from_secs(3));
+                if mode == ProxyMode::Off {
+                    // 即使 builder 已有代理，off 也必须清除它；不修改测试进程的环境。
+                    builder = builder.proxy(Proxy::all(&settings.proxy_url).unwrap());
+                }
+                let client = apply_to_builder(builder, &settings)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                let response = client
+                    .get(format!("http://{origin}/route"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.text().await.unwrap(), expected);
+            }
+            origin_task.abort();
+            proxy_task.abort();
+        });
+    }
 
     #[test]
     fn unreadable_or_corrupt_settings_are_not_defaults() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(PROXY_FILE_NAME);
         fs::write(&path, b"invalid json").unwrap();
-        assert!(init(dir.path().to_path_buf()).is_err());
+        assert!(read_settings(&path).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"invalid json");
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
-        assert!(init(dir.path().to_path_buf()).is_err());
+        assert!(read_settings(&path).is_err());
     }
 
     #[test]
     fn saving_twice_replaces_existing_file() {
         let dir = TempDir::new().unwrap();
-        init(dir.path().to_path_buf()).unwrap();
+        let path = dir.path().join(PROXY_FILE_NAME);
+        fs::write(&path, b"invalid json").unwrap();
+        init(dir.path().to_path_buf());
+        assert!(get().is_err());
+        assert!(cached_client("test", Duration::from_secs(1), || "build failed".into()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"invalid json");
+        fs::write(&path, b"{}").unwrap();
+        assert_eq!(get().unwrap(), ProxySettings::default());
         let first = ProxySettings {
             mode: ProxyMode::Manual,
             proxy_url: "http://127.0.0.1:7890".to_string(),
@@ -268,7 +337,7 @@ mod tests {
             no_proxy: "localhost".to_string(),
         };
         set(second.clone()).unwrap();
-        assert_eq!(get(), second);
+        assert_eq!(get().unwrap(), second);
         let bytes = fs::read(dir.path().join(PROXY_FILE_NAME)).unwrap();
         let restored: ProxySettings = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(restored, second);
@@ -278,7 +347,7 @@ mod tests {
                 ..second.clone()
             };
             assert!(set(invalid).is_err());
-            assert_eq!(get(), second);
+            assert_eq!(get().unwrap(), second);
             assert_eq!(fs::read(dir.path().join(PROXY_FILE_NAME)).unwrap(), bytes);
         }
     }
