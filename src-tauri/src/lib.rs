@@ -80,13 +80,17 @@ fn get_local_diagnostics(app: AppHandle) -> Result<LocalDiagnostics, String> {
 }
 
 #[tauri::command]
-fn get_network_proxy() -> Result<proxy::ProxySettings, String> {
-    proxy::get()
+async fn get_network_proxy() -> Result<proxy::ProxySettings, String> {
+    tauri::async_runtime::spawn_blocking(proxy::get)
+        .await
+        .map_err(|_| "无法读取代理设置".to_string())?
 }
 
 #[tauri::command]
-fn set_network_proxy(settings: proxy::ProxySettings) -> Result<proxy::ProxySettings, String> {
-    proxy::set(settings)
+async fn set_network_proxy(settings: proxy::ProxySettings) -> Result<proxy::ProxySettings, String> {
+    tauri::async_runtime::spawn_blocking(move || proxy::set(settings))
+        .await
+        .map_err(|_| "代理设置保存失败".to_string())?
 }
 
 #[tauri::command]

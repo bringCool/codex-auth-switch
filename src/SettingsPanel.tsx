@@ -215,6 +215,7 @@ export function SettingsPanel({
   const [proxyError, setProxyError] = useState<MessageKey | null>(null);
   const [proxyLoaded, setProxyLoaded] = useState(false);
   const proxyPersistedRef = useRef<NetworkProxySettings | null>(null);
+  const proxyDraftRef = useRef(networkProxy);
   const proxySavesInFlightRef = useRef(0);
   const proxySaveTimerRef = useRef<number | null>(null);
   const proxyPendingRef = useRef<NetworkProxySettings | null>(null);
@@ -232,6 +233,8 @@ export function SettingsPanel({
     { label: t("proxyModeManual"), value: "manual" },
   ];
   const updateNetworkProxy = useCallback((next: NetworkProxySettings) => {
+    proxyDraftRef.current = next;
+    proxyPendingRef.current = next;
     setProxyError(null);
     setNetworkProxyState(next);
   }, []);
@@ -241,6 +244,7 @@ export function SettingsPanel({
       .then((settings) => {
         if (!cancelled) {
           proxyPersistedRef.current = settings;
+          proxyDraftRef.current = settings;
           setNetworkProxyState(settings);
           setProxyLoaded(true);
         }
@@ -278,7 +282,13 @@ export function SettingsPanel({
         .then((saved) => {
           proxyPersistedRef.current = saved;
         })
-        .catch(() => setProxyError("proxySaveFailed"))
+        .catch(() => {
+          // 旧请求失败不能覆盖后续编辑；当前草稿保留，供重试或卸载时补保存。
+          if (proxyDraftRef.current === networkProxy) {
+            proxyPendingRef.current = networkProxy;
+            setProxyError("proxySaveFailed");
+          }
+        })
         .finally(() => {
           proxySavesInFlightRef.current -= 1;
         });
@@ -588,6 +598,15 @@ export function SettingsPanel({
           {proxyError && (
             <p className="settings-error" role="alert">
               {t(proxyError)}
+              {proxyError === "proxySaveFailed" && (
+                <button
+                  type="button"
+                  className="button secondary compact"
+                  onClick={() => updateNetworkProxy({ ...networkProxy })}
+                >
+                  {t("retry")}
+                </button>
+              )}
             </p>
           )}
         </section>

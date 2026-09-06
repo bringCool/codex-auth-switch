@@ -696,11 +696,24 @@ export const removeAccount = (profileId: string) =>
 export const copyAuthTransfer = (profileId: string) =>
   call<void>("copy_auth_transfer", { profileId });
 
+// 读写共享队列，跨面板卸载也保持顺序；重新打开设置页会等待此前保存完成。
+let networkProxyQueue: Promise<void> = Promise.resolve();
+const queueNetworkProxy = <T>(operation: () => Promise<T>): Promise<T> => {
+  const result = networkProxyQueue.then(operation);
+  networkProxyQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+};
+
 export const getNetworkProxy = () =>
-  call<NetworkProxySettings>("get_network_proxy");
+  queueNetworkProxy(() => call<NetworkProxySettings>("get_network_proxy"));
 
 export const setNetworkProxy = (settings: NetworkProxySettings) =>
-  call<NetworkProxySettings>("set_network_proxy", { settings });
+  queueNetworkProxy(() =>
+    call<NetworkProxySettings>("set_network_proxy", { settings }),
+  );
 
 export const prepareAuthTransfer = (profileId: string) =>
   call<AuthTransferPreparation>("prepare_auth_transfer", { profileId });
