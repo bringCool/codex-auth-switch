@@ -440,6 +440,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn child_proxy_modes_override_parameters_and_inherited_environment() {
+        use proxy::{ProxyMode, ProxySettings, PROXY_VARS_FOR_REMOVE};
+        for (mode, no_proxy) in [
+            (ProxyMode::Off, ""),
+            (ProxyMode::System, ""),
+            (ProxyMode::Manual, ""),
+            (ProxyMode::Manual, " localhost,127.0.0.1 "),
+        ] {
+            let settings = ProxySettings {
+                mode,
+                proxy_url: " http://127.0.0.1:7890 ".into(),
+                no_proxy: no_proxy.into(),
+            };
+            let mut command = Command::new("codex");
+            for name in PROXY_VARS_FOR_REMOVE {
+                command.env(name, "http://old.invalid:9");
+            }
+            command
+                .env("NO_PROXY", "old.invalid")
+                .env("no_proxy", "old.invalid");
+            apply_proxy_env(&mut command, &settings);
+            let command = command.as_std();
+            let args = command.get_args().collect::<Vec<_>>();
+            assert_eq!(
+                args,
+                [
+                    "-c",
+                    if mode == ProxyMode::System {
+                        "features.respect_system_proxy=true"
+                    } else {
+                        "features.respect_system_proxy=false"
+                    }
+                ]
+            );
+            let envs = command.get_envs().collect::<Vec<_>>();
+            let value = |name: &str| {
+                envs.iter()
+                    .find(|(key, _)| {
+                        key.to_str().is_some_and(|key| {
+                            if cfg!(windows) {
+                                key.eq_ignore_ascii_case(name)
+                            } else {
+                                key == name
+                            }
+                        })
+                    })
+                    .map(|(_, value)| value.and_then(|value| value.to_str()))
+            };
+            for name in PROXY_VARS_FOR_REMOVE {
+                assert_eq!(
+                    value(name),
+                    Some(match mode {
+                        ProxyMode::Off => None,
+                        ProxyMode::System => Some("http://old.invalid:9"),
+                        ProxyMode::Manual => Some("http://127.0.0.1:7890"),
+                    })
+                );
+            }
+            for name in ["NO_PROXY", "no_proxy"] {
+                let expected = if mode != ProxyMode::Manual {
+                    Some("old.invalid")
+                } else if no_proxy.is_empty() {
+                    None
+                } else {
+                    Some("localhost,127.0.0.1")
+                };
+                assert_eq!(value(name), Some(expected));
+            }
+        }
+    }
+
+    #[test]
     fn preserves_rotated_credentials_when_rpc_fails_or_times_out() {
         for error in [AppServerError::RateLimited, AppServerError::QueryFailed] {
             let home = tempfile::TempDir::new().unwrap();

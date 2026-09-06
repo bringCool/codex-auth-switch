@@ -133,15 +133,18 @@ pub fn set(next: ProxySettings) -> Result<ProxySettings, String> {
     let mut bytes =
         serde_json::to_vec_pretty(&next).map_err(|error| format!("序列化代理设置失败: {error}"))?;
     bytes.push(b'\n');
-    // 复用 manager::atomic_write：tempfile::persist 在 Windows 上也能替换已存在目标，
+    // 与客户端构建使用同一把缓存锁，避免清空后又写回旧设置的客户端。
+    let mut cache = client_cache()
+        .write()
+        .map_err(|_| "代理设置保存失败".to_string())?;
+    let mut guard = settings_runtime()
+        .write()
+        .map_err(|_| "代理设置保存失败".to_string())?;
+    // 复用 manager::atomic_write：tempfile::persist 在 Windows 上也能替换已存在目标,
     // 避免 std::fs::rename 在 Windows 首次保存后稳定失败的问题。
     crate::manager::atomic_write(path, &bytes).map_err(|error| error.to_string())?;
-    {
-        let mut guard = settings_runtime()
-            .write()
-            .map_err(|_| "代理设置保存失败".to_string())?;
-        *guard = Ok(next.clone());
-    }
+    *guard = Ok(next.clone());
+    cache.clear();
     Ok(next)
 }
 
@@ -215,28 +218,31 @@ pub fn child_proxy_env(settings: &ProxySettings) -> ChildProxyEnv {
 
 pub const PROXY_VARS_FOR_REMOVE: &[&str] = PROXY_ENV_VARS;
 
-// 缓存 key 使用 (设置, 超时秒数)：手动代理切换后会重建客户端，
+// 仅保留当前设置的各超时客户端；保存配置后清空，以重新读取系统代理。
 // 同一次登录轮询期间复用连接池。reqwest 的 Client 是廉价 Arc 克隆。
 type ClientCache = HashMap<(ProxySettings, u64), Client>;
 static CLIENT_CACHE: OnceLock<RwLock<ClientCache>> = OnceLock::new();
+
+fn client_cache() -> &'static RwLock<ClientCache> {
+    CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 pub fn cached_client(
     user_agent: &str,
     timeout: Duration,
     build_error: impl FnOnce() -> String,
 ) -> Result<Client, String> {
+    // 锁顺序与 set 一致：先缓存再设置；构建完成前不允许切换配置。
+    let mut cache = client_cache()
+        .write()
+        .map_err(|_| "无法读取代理设置".to_string())?;
     let settings = get()?;
     let key = (settings.clone(), timeout.as_secs());
-    let cache = CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-    if let Ok(guard) = cache.read() {
-        if let Some(client) = guard.get(&key) {
-            return Ok(client.clone());
-        }
+    if let Some(client) = cache.get(&key) {
+        return Ok(client.clone());
     }
     let client = build_client(&settings, user_agent, timeout, build_error)?;
-    if let Ok(mut guard) = cache.write() {
-        guard.entry(key).or_insert_with(|| client.clone());
-    }
+    cache.insert(key, client.clone());
     Ok(client)
 }
 
@@ -315,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn saving_twice_replaces_existing_file() {
+    fn settings_recovery_saves_and_cache_invalidation() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(PROXY_FILE_NAME);
         fs::write(&path, b"invalid json").unwrap();
@@ -325,18 +331,32 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"invalid json");
         fs::write(&path, b"{}").unwrap();
         assert_eq!(get().unwrap(), ProxySettings::default());
+        for timeout in [1, 2, 1] {
+            cached_client("test", Duration::from_secs(timeout), || {
+                "build failed".into()
+            })
+            .unwrap();
+        }
+        assert_eq!(client_cache().read().unwrap().len(), 2);
         let first = ProxySettings {
             mode: ProxyMode::Manual,
             proxy_url: "http://127.0.0.1:7890".to_string(),
             no_proxy: String::new(),
         };
         set(first).unwrap();
+        assert!(client_cache().read().unwrap().is_empty());
+        set(ProxySettings::default()).unwrap();
+        assert!(client_cache().read().unwrap().is_empty());
+        cached_client("test", Duration::from_secs(1), || "build failed".into()).unwrap();
+        assert_eq!(client_cache().read().unwrap().len(), 1);
         let second = ProxySettings {
             mode: ProxyMode::Manual,
             proxy_url: "http://127.0.0.1:1080".to_string(),
             no_proxy: "localhost".to_string(),
         };
         set(second.clone()).unwrap();
+        assert!(client_cache().read().unwrap().is_empty());
+        cached_client("test", Duration::from_secs(1), || "build failed".into()).unwrap();
         assert_eq!(get().unwrap(), second);
         let bytes = fs::read(dir.path().join(PROXY_FILE_NAME)).unwrap();
         let restored: ProxySettings = serde_json::from_slice(&bytes).unwrap();
@@ -347,8 +367,14 @@ mod tests {
                 ..second.clone()
             };
             assert!(set(invalid).is_err());
+            assert_eq!(client_cache().read().unwrap().len(), 1);
             assert_eq!(get().unwrap(), second);
             assert_eq!(fs::read(dir.path().join(PROXY_FILE_NAME)).unwrap(), bytes);
         }
+        // 即使保存相同的 system 值，也应刷新系统代理快照。
+        set(ProxySettings::default()).unwrap();
+        cached_client("test", Duration::from_secs(1), || "build failed".into()).unwrap();
+        set(ProxySettings::default()).unwrap();
+        assert!(client_cache().read().unwrap().is_empty());
     }
 }
