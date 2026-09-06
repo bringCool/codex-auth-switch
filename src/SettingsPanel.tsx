@@ -212,8 +212,10 @@ export function SettingsPanel({
   const [networkProxy, setNetworkProxyState] = useState<NetworkProxySettings>(
     defaultNetworkProxySettings,
   );
-  const [proxyError, setProxyError] = useState<string | null>(null);
-  const proxyLoadedRef = useRef(false);
+  const [proxyError, setProxyError] = useState<MessageKey | null>(null);
+  const [proxyLoaded, setProxyLoaded] = useState(false);
+  const proxyPersistedRef = useRef<NetworkProxySettings | null>(null);
+  const proxySavesInFlightRef = useRef(0);
   const proxySaveTimerRef = useRef<number | null>(null);
   const proxyPendingRef = useRef<NetworkProxySettings | null>(null);
   const updateTotalRef = useRef<number | null>(null);
@@ -238,18 +240,31 @@ export function SettingsPanel({
     getNetworkProxy()
       .then((settings) => {
         if (!cancelled) {
+          proxyPersistedRef.current = settings;
           setNetworkProxyState(settings);
-          proxyLoadedRef.current = true;
+          setProxyLoaded(true);
         }
       })
-      .catch(() => undefined);
+      .catch(() => {
+        if (!cancelled) setProxyError("proxyLoadFailed");
+      });
     return () => {
       cancelled = true;
     };
   }, []);
   // 本地状态变化后防抖写入后端；等加载完成后再保存，避免用默认值覆盖已有配置。
   useEffect(() => {
-    if (!proxyLoadedRef.current) return;
+    const persisted = proxyPersistedRef.current;
+    if (
+      !proxyLoaded ||
+      (proxySavesInFlightRef.current === 0 &&
+        persisted?.mode === networkProxy.mode &&
+        persisted.proxyUrl === networkProxy.proxyUrl &&
+        persisted.noProxy === networkProxy.noProxy)
+    ) {
+      proxyPendingRef.current = null;
+      return;
+    }
     if (proxySaveTimerRef.current !== null) {
       window.clearTimeout(proxySaveTimerRef.current);
     }
@@ -258,9 +273,15 @@ export function SettingsPanel({
       proxySaveTimerRef.current = null;
       proxyPendingRef.current = null;
       setProxyError(null);
-      setNetworkProxy(networkProxy).catch(() =>
-        setProxyError(t("proxySaveFailed")),
-      );
+      proxySavesInFlightRef.current += 1;
+      setNetworkProxy(networkProxy)
+        .then((saved) => {
+          proxyPersistedRef.current = saved;
+        })
+        .catch(() => setProxyError("proxySaveFailed"))
+        .finally(() => {
+          proxySavesInFlightRef.current -= 1;
+        });
     }, 350);
     return () => {
       if (proxySaveTimerRef.current !== null) {
@@ -268,7 +289,7 @@ export function SettingsPanel({
         proxySaveTimerRef.current = null;
       }
     };
-  }, [networkProxy, t]);
+  }, [networkProxy, proxyLoaded]);
   // 设置面板会随标签切换被卸载：卸载时立即写入仍待保存的值，避免防抖丢失最后一次修改。
   useEffect(
     () => () => {
@@ -506,6 +527,7 @@ export function SettingsPanel({
             </div>
             <SegmentedControl
               ariaLabel={t("proxyMode")}
+              disabled={!proxyLoaded}
               options={proxyModeOptions}
               value={networkProxy.mode}
               onChange={(mode) => updateNetworkProxy({ ...networkProxy, mode })}
@@ -527,6 +549,7 @@ export function SettingsPanel({
                   autoCorrect="off"
                   spellCheck={false}
                   aria-label={t("proxyUrl")}
+                  disabled={!proxyLoaded}
                   value={networkProxy.proxyUrl}
                   placeholder={t("proxyUrlPlaceholder")}
                   onChange={(event) =>
@@ -549,6 +572,7 @@ export function SettingsPanel({
                   autoCorrect="off"
                   spellCheck={false}
                   aria-label={t("proxyNoProxy")}
+                  disabled={!proxyLoaded}
                   value={networkProxy.noProxy}
                   onChange={(event) =>
                     updateNetworkProxy({
@@ -563,7 +587,7 @@ export function SettingsPanel({
 
           {proxyError && (
             <p className="settings-error" role="alert">
-              {proxyError}
+              {t(proxyError)}
             </p>
           )}
         </section>

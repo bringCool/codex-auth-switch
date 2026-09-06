@@ -441,6 +441,8 @@ const previewDiagnostics: LocalDiagnostics = {
   ],
 };
 
+let previewNetworkProxy = defaultNetworkProxySettings();
+
 const previewCodexContextConfig: CodexContextConfig = {
   mode: "default",
   contextWindow: null,
@@ -509,12 +511,13 @@ const call = <T>(command: string, args?: Record<string, unknown>) => {
       return Promise.resolve(structuredClone(previewDiagnostics) as T);
     }
     if (command === "get_network_proxy") {
-      return Promise.resolve(defaultNetworkProxySettings() as T);
+      return Promise.resolve(structuredClone(previewNetworkProxy) as T);
     }
     if (command === "set_network_proxy") {
       const settings = (args?.settings ??
         defaultNetworkProxySettings()) as NetworkProxySettings;
-      return Promise.resolve(structuredClone(settings) as T);
+      previewNetworkProxy = structuredClone(settings);
+      return Promise.resolve(structuredClone(previewNetworkProxy) as T);
     }
     if (command === "get_codex_managed_config") {
       return Promise.resolve(structuredClone(previewCodexManagedConfig) as T);

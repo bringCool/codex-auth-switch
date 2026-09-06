@@ -400,9 +400,7 @@ pub fn run() {
         })
         .manage(app_update::AppUpdateState::default())
         .setup(|app| {
-            if let Ok(app_data_dir) = app.path().app_data_dir() {
-                proxy::init(app_data_dir);
-            }
+            proxy::init(app.path().app_data_dir()?).map_err(std::io::Error::other)?;
             if let Ok(manager) = account_manager(app.handle()) {
                 let path = manager.usage_cache_path();
                 tauri::async_runtime::spawn_blocking(move || {

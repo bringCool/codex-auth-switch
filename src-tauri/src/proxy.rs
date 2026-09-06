@@ -77,19 +77,37 @@ fn settings_runtime() -> &'static RwLock<Option<ProxySettings>> {
 }
 
 /// 初始化代理运行时：从应用数据目录读取（或创建默认）配置。
-pub fn init(app_data_dir: PathBuf) {
+pub fn init(app_data_dir: PathBuf) -> Result<(), String> {
     let path = app_data_dir.join(PROXY_FILE_NAME);
-    let loaded = fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<ProxySettings>(&bytes).ok())
-        .unwrap_or_default();
+    let loaded = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<ProxySettings>(&bytes)
+            .map_err(|_| "代理配置文件格式错误，请检查 network-proxy.json".to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProxySettings::default(),
+        Err(_) => {
+            return Err("无法读取代理配置文件，请检查 network-proxy.json 的访问权限".to_string())
+        }
+    };
+    validate(&loaded)?;
     if FILE_PATH.set(path).is_ok() {
         let mut guard = match settings_runtime().write() {
             Ok(guard) => guard,
-            Err(_) => return,
+            Err(_) => return Err("代理设置初始化失败".to_string()),
         };
         *guard = Some(loaded);
     }
+    Ok(())
+}
+
+fn validate(settings: &ProxySettings) -> Result<(), String> {
+    if settings.mode == ProxyMode::Manual {
+        let url = reqwest::Url::parse(settings.proxy_url.trim())
+            .map_err(|_| "请输入有效的 HTTP(S) 代理地址".to_string())?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err("请输入有效的 HTTP(S) 代理地址".to_string());
+        }
+        Proxy::all(url).map_err(|_| "请输入有效的 HTTP(S) 代理地址".to_string())?;
+    }
+    Ok(())
 }
 
 pub fn get() -> ProxySettings {
@@ -102,6 +120,7 @@ pub fn get() -> ProxySettings {
 
 /// 保存配置并即时生效；写入失败会保留内存中的旧值。
 pub fn set(next: ProxySettings) -> Result<ProxySettings, String> {
+    validate(&next)?;
     let path = FILE_PATH
         .get()
         .ok_or_else(|| "代理设置尚未初始化".to_string())?;
@@ -136,7 +155,7 @@ fn apply_to_builder(
             if url.is_empty() {
                 return Ok(builder.no_proxy());
             }
-            let proxy = Proxy::all(url).map_err(|error| format!("代理地址无效: {error}"))?;
+            let proxy = Proxy::all(url).map_err(|_| "请输入有效的 HTTP(S) 代理地址".to_string())?;
             // 空列表会被解析为“无绕过主机”，因此这里可以无条件绑定。
             let proxy = proxy.no_proxy(NoProxy::from_string(settings.no_proxy.trim()));
             Ok(builder.proxy(proxy))
@@ -222,9 +241,21 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn unreadable_or_corrupt_settings_are_not_defaults() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(PROXY_FILE_NAME);
+        fs::write(&path, b"invalid json").unwrap();
+        assert!(init(dir.path().to_path_buf()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"invalid json");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(init(dir.path().to_path_buf()).is_err());
+    }
+
+    #[test]
     fn saving_twice_replaces_existing_file() {
         let dir = TempDir::new().unwrap();
-        init(dir.path().to_path_buf());
+        init(dir.path().to_path_buf()).unwrap();
         let first = ProxySettings {
             mode: ProxyMode::Manual,
             proxy_url: "http://127.0.0.1:7890".to_string(),
@@ -241,5 +272,14 @@ mod tests {
         let bytes = fs::read(dir.path().join(PROXY_FILE_NAME)).unwrap();
         let restored: ProxySettings = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(restored, second);
+        for url in ["", "http://[invalid", "socks5://127.0.0.1:1080"] {
+            let invalid = ProxySettings {
+                proxy_url: url.to_string(),
+                ..second.clone()
+            };
+            assert!(set(invalid).is_err());
+            assert_eq!(get(), second);
+            assert_eq!(fs::read(dir.path().join(PROXY_FILE_NAME)).unwrap(), bytes);
+        }
     }
 }

@@ -234,18 +234,20 @@ const backendErrorPatterns: Array<[RegExp, (...matches: string[]) => string]> =
       (path, detail) => `Could not create directory ${path}: ${detail}`,
     ],
     [
-      /^写入临时认证文件失败: (.+)$/,
-      (detail) =>
-        `Could not write the temporary authentication file: ${detail}`,
+      /^写入临时(?:认证)?文件失败: (.+)$/,
+      (detail) => `Could not write the temporary file: ${detail}`,
     ],
     [
-      /^同步临时认证文件失败: (.+)$/,
-      (detail) => `Could not sync the temporary authentication file: ${detail}`,
+      /^同步临时(?:认证)?文件失败: (.+)$/,
+      (detail) => `Could not sync the temporary file: ${detail}`,
     ],
     [
-      /^创建临时认证文件失败: (.+)$/,
-      (detail) =>
-        `Could not create the temporary authentication file: ${detail}`,
+      /^创建临时(?:认证)?文件失败: (.+)$/,
+      (detail) => `Could not create the temporary file: ${detail}`,
+    ],
+    [
+      /^同步(?:认证)?目录失败: (.+)$/,
+      (detail) => `Could not sync the directory: ${detail}`,
     ],
     [
       /^原子替换 (.+) 失败: (.+)$/,
